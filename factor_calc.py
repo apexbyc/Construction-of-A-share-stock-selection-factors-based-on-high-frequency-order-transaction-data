@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-高频订单因子计算 - 单日优化版
-阈值计算：使用均值+标准差
-
+高频订单因子计算 - 单日版
 核心功能：处理单日股票高频交易数据，计算订单行为特征因子
 优化特点：
 1. 不使用date列（因为所有数据都是同一天）
-2. 阈值计算使用均值+标准差（原为90%分位数）
-3. 输出CSV和Parquet格式
+2. 输出CSV和Parquet格式
 """
 import os
 import time as tm
@@ -28,7 +25,7 @@ CONT_PM = (time(13, 0), time(14, 57))  # 下午连续竞价时间段
 # -------------------- 2. 核心计算函数 --------------------
 def compute_factors_ultimate_single_day(secucode: str, target_date: str, df: pd.DataFrame) -> Optional[dict]:
     """
-    单日优化版因子计算函数（使用均值+标准差阈值）
+    单日优化版因子计算函数
 
     功能：计算股票的高频订单因子
     输入：
@@ -37,8 +34,6 @@ def compute_factors_ultimate_single_day(secucode: str, target_date: str, df: pd.
         df: 单只股票的单日交易数据
     输出：
         dict: 包含所有计算因子的字典，如果数据无效返回None
-
-    阈值计算修改：原使用90%分位数，现改为均值+标准差
     """
     # 数据有效性检查：空数据或成交量为0的数据直接跳过
     if df.empty or df["Volume"].sum() == 0:
@@ -81,46 +76,26 @@ def compute_factors_ultimate_single_day(secucode: str, target_date: str, df: pd.
     buy["buy_duration"] = calc_duration_fast(buy["buy_first_time"], buy["buy_last_time"])
     sell["sell_duration"] = calc_duration_fast(sell["sell_first_time"], sell["sell_last_time"])
 
-    # -------------------- 步骤3：计算阈值（修改：均值+标准差） --------------------
-    def threshold_mean_std(series):
+    # -------------------- 步骤3：计算阈值（90%分位数） --------------------
+    def threshold_fast(series):
         """
-        计算均值+标准差作为阈值
+        快速计算阈值（90%分位数）
 
         逻辑：
-        1. 过滤NaN值
-        2. 如果数据少于1个，返回0
-        3. 计算均值和标准差
-        4. 返回均值 + 1倍标准差作为阈值
-
-        解释：均值+标准差作为阈值，大约会筛选出数据中约16%的值（正态分布假设下）
-        相比原来的90%分位数（筛选前10%），这个阈值会更宽松一些
+        1. 提取序列值
+        2. 如果数据少于2个，返回唯一值或0
+        3. 使用numpy的percentile计算90%分位数，比pandas更快
         """
         vals = series.values
-        # 过滤NaN值
-        vals = vals[~np.isnan(vals)]
-
-        if len(vals) == 0:
-            return 0.0
-
-        if len(vals) == 1:
-            # 只有一个值，标准差为0，阈值为该值本身
-            return float(vals[0])
-
-        # 计算均值和标准差
-        mean_val = np.mean(vals)
-        std_val = np.std(vals)
-
-        # 阈值 = 均值 + 1倍标准差
-        threshold = mean_val + std_val
-
-        return float(threshold)
+        if len(vals) < 2:
+            return float(vals[0]) if len(vals) == 1 else 0.0
+        return float(np.percentile(vals[~np.isnan(vals)], 90))
 
     # 计算4个阈值：大买单、大卖单、长买单、长卖单的阈值
-    # 使用均值+标准差方法
-    buy_big_thr = threshold_mean_std(buy["buy_volume"])  # 大买单成交量阈值
-    sell_big_thr = threshold_mean_std(sell["sell_volume"])  # 大卖单成交量阈值
-    buy_long_thr = threshold_mean_std(buy["buy_duration"])  # 长买单持续时间阈值
-    sell_long_thr = threshold_mean_std(sell["sell_duration"])  # 长卖单持续时间阈值
+    buy_big_thr = threshold_fast(buy["buy_volume"])  # 大买单成交量阈值
+    sell_big_thr = threshold_fast(sell["sell_volume"])  # 大卖单成交量阈值
+    buy_long_thr = threshold_fast(buy["buy_duration"])  # 长买单持续时间阈值
+    sell_long_thr = threshold_fast(sell["sell_duration"])  # 长卖单持续时间阈值
 
     # -------------------- 步骤4：将订单特征映射回原始数据 --------------------
     # 创建字典映射：订单ID -> 订单特征（比merge更高效）
@@ -143,6 +118,8 @@ def compute_factors_ultimate_single_day(secucode: str, target_date: str, df: pd.
     df["is_long_sell"] = df["sell_duration"] > sell_long_thr  # 长卖单标记
 
     # -------------------- 步骤6：计算16类订单比例因子 --------------------
+    # 使用二进制编码将4个布尔标记转换为0-15的整数（16种组合）
+    # 编码规则：is_big_buy(8) + is_big_sell(4) + is_long_buy(2) + is_long_sell(1)
     code = (df["is_big_buy"].astype(int) * 8 +
             df["is_big_sell"].astype(int) * 4 +
             df["is_long_buy"].astype(int) * 2 +
@@ -214,11 +191,11 @@ def compute_factors_ultimate_single_day(secucode: str, target_date: str, df: pd.
         "buy_orders": len(buy),  # 买单数量
         "sell_orders": len(sell),  # 卖单数量
 
-        # 阈值信息（使用均值+标准差计算）
-        "buy_big_threshold": buy_big_thr,  # 大买单阈值（均值+标准差）
-        "sell_big_threshold": sell_big_thr,  # 大卖单阈值（均值+标准差）
-        "buy_long_threshold": buy_long_thr,  # 长买单阈值（均值+标准差）
-        "sell_long_threshold": sell_long_thr,  # 长卖单阈值（均值+标准差）
+        # 阈值信息
+        "buy_big_threshold": buy_big_thr,  # 大买单阈值
+        "sell_big_threshold": sell_big_thr,  # 大卖单阈值
+        "buy_long_threshold": buy_long_thr,  # 长买单阈值
+        "sell_long_threshold": sell_long_thr,  # 长卖单阈值
 
         # 6个子因子
         "big_buy_non_big_sell": bb_ns,  # 大买单非大卖单比例
@@ -242,7 +219,7 @@ def compute_factors_ultimate_single_day(secucode: str, target_date: str, df: pd.
 # -------------------- 3. 主函数 --------------------
 def calculate_factors_single_day_complete(data_path: str, target_date: str, output_dir: str = None):
     """
-    主函数：单日数据完整因子计算流程（使用均值+标准差阈值）
+    主函数：单日数据完整因子计算流程
 
     功能：组织完整的因子计算流程，包括数据加载、预处理、计算和保存
     输入：
@@ -251,13 +228,11 @@ def calculate_factors_single_day_complete(data_path: str, target_date: str, outp
         output_dir: 输出目录路径
     输出：
         tuple: (结果DataFrame, 各阶段耗时字典)
-
-    阈值计算已修改为使用均值+标准差方法
     """
     print("=" * 80)
-    print("📊 高频订单因子计算 - 单日完整版（均值+标准差阈值）")
+    print("📊 高频订单因子计算 - 单日完整版")
     print(f"📅 目标日期: {target_date}")
-    print("⚡ 特点：不使用date列，用16个因子替换select因子，阈值=均值+标准差")
+    print("⚡ 特点：不使用date列，用16个因子替换select因子")
     print("=" * 80)
 
     timings = {}  # 记录各阶段耗时
@@ -325,7 +300,7 @@ def calculate_factors_single_day_complete(data_path: str, target_date: str, outp
 
     # -------------------- 阶段4：因子计算 --------------------
     t3 = tm.time()
-    print("   4. 因子计算（使用均值+标准差阈值）...")
+    print("   4. 因子计算...")
 
     results = []  # 存储所有股票的计算结果
     total = len(groups)
@@ -333,7 +308,7 @@ def calculate_factors_single_day_complete(data_path: str, target_date: str, outp
 
     # 遍历每只股票进行计算
     for i, (stk, date_str, sub_df) in enumerate(groups):
-        # 调用核心计算函数（已修改为使用均值+标准差阈值）
+        # 调用核心计算函数
         result = compute_factors_ultimate_single_day(stk, date_str, sub_df)
         if result:
             results.append(result)
@@ -362,9 +337,9 @@ def calculate_factors_single_day_complete(data_path: str, target_date: str, outp
             # 确保输出目录存在
             os.makedirs(output_dir, exist_ok=True)
 
-            # 生成文件名（包含日期和阈值方法）
+            # 生成文件名（包含日期）
             date_str_for_filename = target_date.replace('-', '')[:8]  # 格式化为YYYYMMDD
-            base_filename = f"高频订单因子_单日完整_{date_str_for_filename}_均值加标准差阈值"
+            base_filename = f"高频订单因子_单日完整_{date_str_for_filename}"
 
             # 保存为CSV格式（便于人工查看）
             csv_path = os.path.join(output_dir, f"{base_filename}.csv")
@@ -383,6 +358,15 @@ def calculate_factors_single_day_complete(data_path: str, target_date: str, outp
             print(f"   结果形状: {factors_df.shape}")
             print(f"   列数: {len(factors_df.columns)}")
 
+            # 显示详细的列统计信息
+            print(f"\n📊 输出列统计:")
+            print(f"   基本信息列: 7个")
+            print(f"   阈值列: 4个")
+            print(f"   子因子列: 6个")
+            print(f"   核心因子列: 4个")
+            print(f"   订单类型因子: 16个")
+            print(f"   总列数: {7 + 4 + 6 + 4 + 16}个")
+
         return factors_df, timings
 
     # 如果没有结果，返回空的DataFrame
@@ -397,14 +381,13 @@ if __name__ == "__main__":
 
     # ==================== 配置参数 ====================
     # 数据文件路径
-    DATA = r"D:/pycharm/pythonProject/dataExample_5k.parquet"
+    DATA = r"D:/pycharm/pythonProject/dataExample.parquet"
 
     # 输出目录
     OUT_DIR = r"D:/pycharm/pythonProject"
 
     # 目标日期（根据实际数据设置）
     TARGET_DATE = "2024-01-15"
-
     try:
         # 执行因子计算
         df_fac, timings = calculate_factors_single_day_complete(
@@ -448,7 +431,6 @@ if __name__ == "__main__":
             print(f"   股票数量: {len(df_fac)}")
             print(f"   总因子数: {len(df_fac.columns)}")
             print(f"   16个订单类型因子: {len(factor_columns)}个")
-            print(f"   阈值计算方法: 均值+标准差")
 
             # 验证：检查是否包含所有应有的因子
             expected_columns = [
@@ -464,14 +446,7 @@ if __name__ == "__main__":
             if missing:
                 print(f"   ⚠️  缺少的原有因子: {missing}")
             else:
-                print("   ✅ 所有原有因子（除select）都在输出中")
-
-            # 显示阈值统计信息（可选）
-            print(f"\n📈 阈值统计（均值+标准差）:")
-            print(f"   大买单成交量阈值均值: {df_fac['buy_big_threshold'].mean():.2f}")
-            print(f"   大卖单成交量阈值均值: {df_fac['sell_big_threshold'].mean():.2f}")
-            print(f"   长买单持续时间阈值均值: {df_fac['buy_long_threshold'].mean():.2f}秒")
-            print(f"   长卖单持续时间阈值均值: {df_fac['sell_long_threshold'].mean():.2f}秒")
+                print("   ✅ 所有原有因子都在输出中")
 
     # 异常处理
     except Exception as e:
